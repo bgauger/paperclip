@@ -10,6 +10,7 @@ import {
   parseSetupTokenPrompt,
   type SetupTokenPrompt,
 } from "./setup-token-parse.js";
+import type { TerminalScreenOptions } from "./terminal-screen.js";
 
 // The Claude `setup-token` login runner. It starts `claude setup-token` through
 // an injected {@link SetupTokenPtyDriver}, surfaces the sign-in prompt one time
@@ -70,6 +71,14 @@ export const CODE_SUBMIT_SETTLE_MS = 150;
  * that spans a chunk boundary.
  */
 export const CLAUDE_SETUP_TOKEN_MAX_BUFFER_CHARS = 64 * 1024;
+
+/**
+ * The PTY size a local driver should give the login child. A real window size
+ * keeps Claude Code's layout deterministic, and the runner renders the stream at
+ * this size when the raw-stream parsers do not match (see `terminal-screen.ts`).
+ */
+export const CLAUDE_SETUP_TOKEN_PTY_COLUMNS = 120;
+export const CLAUDE_SETUP_TOKEN_PTY_ROWS = 40;
 
 /**
  * The child side of the setup-token run. The runner never spawns the PTY
@@ -147,6 +156,12 @@ export interface RunSetupTokenLoginOptions extends LoginRunnerLifecycleOptions {
    * write. Defaults to {@link CODE_SUBMIT_SETTLE_MS}. A test sets it to 0.
    */
   codeSubmitSettleMs?: number;
+  /**
+   * The PTY size the driver gave the child. When set, the runner also parses the
+   * rendered screen at this size if the raw-stream parse does not match. A driver
+   * that cannot state its PTY size leaves it unset and keeps raw parsing only.
+   */
+  terminal?: TerminalScreenOptions;
 }
 
 /**
@@ -242,6 +257,13 @@ export async function runSetupTokenLogin(
   // it binds the token. It bounds the retained window the same way as the prompt
   // buffer, so the secret-bearing stream never grows without a bound.
   let tokenBuffer = "";
+  // The whole stream from the start, for the rendered-screen fallback. A
+  // differential renderer only draws what changed, so the screen state needs
+  // every earlier byte. It stays bounded; past the bound the fallback is off.
+  // It is dropped with the other buffers once the token binds.
+  let transcript = "";
+  let transcriptOverflow = false;
+  const terminal = options.terminal;
 
   // Reads the browser code and writes it to the matched prompt one time. The
   // routine never throws: it logs a fixed line on a provider error or a write
@@ -278,10 +300,12 @@ export async function runSetupTokenLogin(
   // bytes later, after a clean exit, through {@link deliverCredential}.
   const captureCredential = (): void => {
     if (!onCredential || tokenBytes) return;
-    const token = parseSetupTokenCredential(tokenBuffer);
+    const token = parseSetupTokenCredential(tokenBuffer)
+      ?? (terminal && !transcriptOverflow ? parseSetupTokenCredential(transcript, terminal) : null);
     if (!token) return;
     tokenBytes = Buffer.from(token, "utf8");
     tokenBuffer = "";
+    transcript = "";
   };
 
   // Awaits the mandatory sink one time with the bound token bytes and reports
@@ -308,11 +332,19 @@ export async function runSetupTokenLogin(
   };
 
   const onData = (chunk: string): void => {
+    if (terminal && !transcriptOverflow && !tokenBytes) {
+      transcript += chunk;
+      if (transcript.length > CLAUDE_SETUP_TOKEN_MAX_BUFFER_CHARS) {
+        transcript = "";
+        transcriptOverflow = true;
+      }
+    }
     if (!promptSurfaced) {
       // Parse the full buffer before any truncation. This order finds an early
       // prompt inside one large chunk, so the runner never drops it.
       buffer += chunk;
-      const prompt = parseSetupTokenPrompt(buffer);
+      const prompt = parseSetupTokenPrompt(buffer)
+        ?? (terminal && !transcriptOverflow ? parseSetupTokenPrompt(transcript, terminal) : null);
       if (prompt) {
         promptSurfaced = true;
         buffer = "";

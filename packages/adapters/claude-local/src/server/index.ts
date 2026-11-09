@@ -53,7 +53,11 @@ export {
   CLAUDE_SETUP_TOKEN_COMMAND,
   CODE_SUBMISSION_TERMINATOR,
   CLAUDE_SETUP_TOKEN_MAX_BUFFER_CHARS,
+  CLAUDE_SETUP_TOKEN_PTY_COLUMNS,
+  CLAUDE_SETUP_TOKEN_PTY_ROWS,
 } from "./setup-token-runner.js";
+export { renderTerminalScreen } from "./terminal-screen.js";
+export type { TerminalScreenOptions } from "./terminal-screen.js";
 export type {
   SetupTokenPtyDriver,
   SetupTokenPromptSink,

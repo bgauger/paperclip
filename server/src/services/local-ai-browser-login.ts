@@ -1,8 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { open } from "node:fs/promises";
+import { open, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
-import { runSetupTokenLogin } from "@paperclipai/adapter-claude-local/server";
+import {
+  CLAUDE_SETUP_TOKEN_PTY_COLUMNS,
+  CLAUDE_SETUP_TOKEN_PTY_ROWS,
+  runSetupTokenLogin,
+} from "@paperclipai/adapter-claude-local/server";
 import { runDeviceLogin } from "@paperclipai/adapter-codex-local/server";
 import { ensureCommandResolvable, resolveCommandForLogs } from "@paperclipai/adapter-utils/server-utils";
 import { resolveCodexCommand } from "../vendor/paperclip-runner/index.js";
@@ -19,11 +23,17 @@ export type LocalBrowserLoginState = {
 // Node has no built-in PTY API. Python's standard-library pty module supplies
 // the terminal required by both CLIs. The Docker image already includes
 // python3. This bridge forwards only bytes; provider output is never logged.
+// The child gets a real window size (argv[1] columns, argv[2] rows). Without
+// one the CLI sees a 0x0 terminal and its layout is not parseable.
 const PYTHON_PTY_BRIDGE = String.raw`
-import errno, os, pty, select, signal, sys
+import errno, fcntl, os, pty, select, signal, struct, sys, termios
+cols, rows = int(sys.argv[1]), int(sys.argv[2])
 pid, master = pty.fork()
 if pid == 0:
-    os.execvpe(sys.argv[1], sys.argv[1:], os.environ)
+    if cols > 0 and rows > 0:
+        try: fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        except OSError: pass
+    os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 def stop(_signal, _frame):
     try: os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError: pass
@@ -45,6 +55,25 @@ while True:
 _, status = os.waitpid(pid, 0)
 sys.exit(os.waitstatus_to_exitcode(status))
 `;
+
+/**
+ * Each attempt uses a fresh CLAUDE_CONFIG_DIR, so Claude Code treats it as a
+ * first run and can stop on onboarding or folder-trust screens that nobody in
+ * the bridge answers. Mark onboarding done and trust the server's working
+ * directory before launch. An existing file is left untouched.
+ */
+async function seedClaudeLoginHome(home: string): Promise<void> {
+  const config = {
+    hasCompletedOnboarding: true,
+    projects: { [process.cwd()]: { hasTrustDialogAccepted: true } },
+  };
+  try {
+    await writeFile(path.join(home, ".claude.json"), JSON.stringify(config), { flag: "wx", mode: 0o600 });
+  } catch {
+    // An existing file, or a home that is not writable yet, is not fatal: the
+    // CLI then runs with its own defaults.
+  }
+}
 
 /** Run the same browser-code login used by sandbox connections on the local host. */
 export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: string): LocalBrowserLoginState {
@@ -79,9 +108,19 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
         CLAUDE_CONFIG_DIR: provider === "anthropic" ? home : process.env.CLAUDE_CONFIG_DIR,
         CODEX_HOME: provider === "openai" ? home : process.env.CODEX_HOME,
         BROWSER: "true",
+        // Claude Code prints a "Hold Shift while selecting…" native-copy hint
+        // between the URL and the code prompt when mouse support is on. The
+        // parser tolerates it, but the login has no use for mouse input.
+        ...(provider === "anthropic" ? { CLAUDE_CODE_DISABLE_MOUSE: "1" } : {}),
       };
+      if (provider === "anthropic") await seedClaudeLoginHome(home);
       return new Promise((resolve, reject) => {
-        child = spawn("python3", ["-u", "-c", PYTHON_PTY_BRIDGE, executable, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
+        child = spawn("python3", ["-u", "-c", PYTHON_PTY_BRIDGE,
+          // Codex keeps its proven 0x0 behaviour; only the Claude login gets a size.
+          ...(provider === "anthropic"
+            ? [String(CLAUDE_SETUP_TOKEN_PTY_COLUMNS), String(CLAUDE_SETUP_TOKEN_PTY_ROWS)]
+            : ["0", "0"]),
+          executable, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
         child.stdout.on("data", (bytes: Buffer) => onData(bytes.toString("utf8")));
         // Provider output may contain secrets. Never log or retain stderr.
         child.stderr.resume();
@@ -103,6 +142,7 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
     state.submitCode = (code) => { deliverCode?.(code); deliverCode = undefined; };
     void runSetupTokenLogin(driver, {
       timeoutMs: 300_000, signal: controller.signal,
+      terminal: { columns: CLAUDE_SETUP_TOKEN_PTY_COLUMNS, rows: CLAUDE_SETUP_TOKEN_PTY_ROWS },
       onPrompt: (prompt) => { state.authorizationUrl = prompt.url; },
       provideCode: (signal) => new Promise<string>((resolve, reject) => {
         const abort = () => reject(new Error("Local sign-in cancelled"));

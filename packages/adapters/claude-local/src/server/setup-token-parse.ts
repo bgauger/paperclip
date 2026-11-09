@@ -24,6 +24,8 @@
 // never log any input byte, and they keep every input byte out of each thrown
 // error. Both parsers are pure functions.
 
+import { renderTerminalScreen, type TerminalScreenOptions } from "./terminal-screen.js";
+
 export interface SetupTokenPrompt {
   // The validated authorization URL, exactly as the terminal emitted it.
   url: string;
@@ -180,6 +182,13 @@ const URL_PREAMBLE_RE = /the url below to sign in/i;
 // characters and spaces. The pattern rejects the phrase when other prose shares
 // the line.
 const PROMPT_LINE_RE = /^Paste code here if prompted\b[\s>*]*$/;
+
+// The native-copy hint. Some Claude CLI builds print one line such as "Hold Shift
+// while selecting to use your terminal's native copy" (the key varies by
+// platform: Shift, Fn, Option, Alt) between the URL block and the browser-code
+// prompt. The prompt binder skips at most one line of exactly this shape; any
+// other intermediate line still fails closed.
+const NATIVE_COPY_HINT_RE = /^Hold \S{1,16} while selecting to use your terminal['’]s native copy\.?$/;
 
 // The maximum number of characters between the end of the URL preamble line and
 // the start of the URL. The Claude UI prints the URL right after the preamble.
@@ -368,6 +377,7 @@ function reassembleUrl(lines: string[], startLine: number): SetupTokenUrlMatch |
  * Returns null when the first non-blank, non-repeat line is not the prompt.
  */
 function findBrowserCodePrompt(lines: string[], endLine: number, url: string): string | null {
+  let hintSkipped = false;
   for (let i = endLine + 1; i < lines.length; i += 1) {
     const trimmed = lines[i].trim();
     if (trimmed.length === 0) continue;
@@ -375,6 +385,12 @@ function findBrowserCodePrompt(lines: string[], endLine: number, url: string): s
     // punctuation first, the same way the repeated-URL comparison needs, so a
     // repeated URL with a trailing punctuation mark still matches.
     if (trimmed.replace(TRAILING_PUNCTUATION_RE, "") === url) continue;
+    // Skip one native-copy hint line. A second hint, or any other prose, still
+    // fails closed below.
+    if (!hintSkipped && NATIVE_COPY_HINT_RE.test(trimmed)) {
+      hintSkipped = true;
+      continue;
+    }
     return PROMPT_LINE_RE.test(trimmed) ? SETUP_TOKEN_PROMPT : null;
   }
   return null;
@@ -394,8 +410,18 @@ function findBrowserCodePrompt(lines: string[], endLine: number, url: string): s
  * URL, and a missing or misplaced prompt. Never throws on input, and never puts
  * any input byte into a log or an error. This phase returns no token.
  */
-export function parseSetupTokenPrompt(text: string): SetupTokenPrompt | null {
+export function parseSetupTokenPrompt(text: string, screen?: TerminalScreenOptions): SetupTokenPrompt | null {
   if (typeof text !== "string" || text.length === 0) return null;
+  const fromStream = parseSetupTokenPromptText(text);
+  if (fromStream || !screen) return fromStream;
+  // Fallback: read the rendered screen. This handles cursor-addressed layout and
+  // per-row OSC 8 hyperlinks whose visible text is one wrapped slice. The same
+  // shape validation applies to the rendered text.
+  return parseSetupTokenPromptText(renderTerminalScreen(text, screen));
+}
+
+function parseSetupTokenPromptText(text: string): SetupTokenPrompt | null {
+  if (text.length === 0) return null;
   const clean = stripTerminalControls(text);
   const preamble = URL_PREAMBLE_RE.exec(clean);
   if (!preamble) return null;
@@ -482,8 +508,20 @@ function singleAnchorIndex(lines: string[], anchor: string): number | null {
  * shape. It never logs any input byte and never puts any input byte into a
  * thrown error. The parser is a pure function.
  */
-export function parseSetupTokenCredential(text: string): string | null {
+export function parseSetupTokenCredential(text: string, screen?: TerminalScreenOptions): string | null {
   if (typeof text !== "string" || text.length === 0) return null;
+  const fromStream = parseSetupTokenCredentialText(text);
+  if (fromStream || !screen) return fromStream;
+  // Fallback: read the rendered screen. Claude's differential renderer skips
+  // cells that already hold the right character and moves between rows with
+  // relative cursor sequences, so the raw stream can read "Your OAuh token
+  // (valid for 1 yer):". The rendered screen restores what the user saw. The
+  // same anchor and token-shape validation applies to the rendered text.
+  return parseSetupTokenCredentialText(renderTerminalScreen(text, screen));
+}
+
+function parseSetupTokenCredentialText(text: string): string | null {
+  if (text.length === 0) return null;
   const clean = stripTerminalControls(text);
   // Canonicalize the record delimiter. The real terminal redraw joins the
   // before-anchor line, the token, and the after-anchor line with a bare
